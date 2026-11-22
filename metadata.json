@@ -1,0 +1,6 @@
+{
+  "name": "AutoAlibaba - Global Car Parts Marketplace",
+  "description": "Global B2B and retail automotive parts marketplace featuring thousands of car components from micro clips and fasteners to full engine assemblies, with real-time search, filters, and multi-method checkout.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

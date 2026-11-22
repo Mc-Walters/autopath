@@ -1,0 +1,14 @@
+# One-click setup for Render (https://render.com): runs the WHOLE site
+# (website + the Express backend in server.ts) as a single web service.
+services:
+  - type: web
+    name: autopath
+    runtime: node
+    plan: free
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: GEMINI_API_KEY
+        sync: false
