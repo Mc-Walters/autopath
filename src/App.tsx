@@ -19,11 +19,13 @@ import { CAR_PARTS_DATA } from './data/partsData';
 import { CarPart, CartItem, FilterState, OrderRecord, PartRequest } from './types';
 import { PackageSearch, RotateCcw, Wrench } from 'lucide-react';
 import { useTranslation } from './context/LanguageContext';
+import { useAuth } from './context/AuthContext';
 import { api } from './services/api';
 import { isMockupOrder, isPendingOrder, upsertOrder, mergeOrders } from './utils/orders';
 
 export default function App() {
   const { t, language, setLanguage } = useTranslation();
+  const { user: authUser } = useAuth();
 
   // --- Global Currency State ---
   const [currentCurrency, setCurrentCurrency] = useState<string>('USD');
@@ -381,6 +383,12 @@ export default function App() {
     setIsOrdersOpen(true);
     void refreshOrders();
   };
+
+  // When a customer logs in (e.g. on a new phone), bring in the orders of THEIR account
+  useEffect(() => {
+    if (authUser?.id) void refreshOrders();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [authUser?.id]);
 
   // Whenever the payment page is shown for an unpaid order, make sure that order
   // is in the pending list (whatever way the customer reached the page).

@@ -63,6 +63,45 @@ export interface BackendHealthResponse {
   rfqsLogged: number;
 }
 
+// ---------------------------------------------------------------------------
+// Identity sent with every request: a private random id for THIS browser, plus
+// the login token if the customer is signed in. The server uses these so each
+// customer only ever sees their own orders and requests.
+// ---------------------------------------------------------------------------
+const CLIENT_ID_KEY = 'apexparts_client_id';
+let memoryClientId = '';
+function newClientId(): string {
+  try {
+    if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) return crypto.randomUUID();
+  } catch {
+    /* fall through */
+  }
+  return 'c' + Math.random().toString(36).slice(2) + Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+function getClientId(): string {
+  try {
+    let id = localStorage.getItem(CLIENT_ID_KEY);
+    if (!id || id.length < 16) {
+      id = newClientId();
+      localStorage.setItem(CLIENT_ID_KEY, id);
+    }
+    return id;
+  } catch {
+    if (!memoryClientId) memoryClientId = newClientId();
+    return memoryClientId;
+  }
+}
+function identityHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  const headers: Record<string, string> = { ...extra, 'X-Client-Id': getClientId() };
+  try {
+    const token = localStorage.getItem('apexparts_auth_token');
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+  } catch {
+    /* no token available */
+  }
+  return headers;
+}
+
 class ApiService {
   private baseUrl = '';
 
@@ -116,6 +155,21 @@ class ApiService {
       return data;
     } catch (err: any) {
       return { success: false, error: err.message || 'Network error during login' };
+    }
+  }
+
+  /**
+   * Invalidate the login token on the server
+   */
+  async logout(token?: string): Promise<void> {
+    try {
+      if (!token) return;
+      await fetch(`${this.baseUrl}/api/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+    } catch {
+      /* ignore network errors on logout */
     }
   }
 
@@ -185,7 +239,7 @@ class ApiService {
    */
   async getOrders(): Promise<OrderRecord[]> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/orders`);
+      const res = await fetch(`${this.baseUrl}/api/orders`, { headers: identityHeaders() });
       if (!res.ok) return [];
       const data = await res.json();
       return data.orders || [];
@@ -201,7 +255,7 @@ class ApiService {
     try {
       const res = await fetch(`${this.baseUrl}/api/orders`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: identityHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload),
       });
 
@@ -232,7 +286,7 @@ class ApiService {
     try {
       const res = await fetch(`${this.baseUrl}/api/orders/${orderId}/verify-payment`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: identityHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload),
       });
 
@@ -254,6 +308,7 @@ class ApiService {
     try {
       const res = await fetch(`${this.baseUrl}/api/orders/${orderId}`, {
         method: 'DELETE',
+        headers: identityHeaders(),
       });
       return res.ok;
     } catch {
@@ -268,6 +323,7 @@ class ApiService {
     try {
       const res = await fetch(`${this.baseUrl}/api/orders`, {
         method: 'DELETE',
+        headers: identityHeaders(),
       });
       return res.ok;
     } catch {
@@ -282,7 +338,7 @@ class ApiService {
     try {
       const res = await fetch(`${this.baseUrl}/api/rfq`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: identityHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify(payload),
       });
 
@@ -302,7 +358,7 @@ class ApiService {
    */
   async getRfqs(): Promise<PartRequest[]> {
     try {
-      const res = await fetch(`${this.baseUrl}/api/rfq`);
+      const res = await fetch(`${this.baseUrl}/api/rfq`, { headers: identityHeaders() });
       if (!res.ok) return [];
       const data = await res.json();
       return data.rfqs || [];

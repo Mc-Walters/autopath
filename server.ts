@@ -6,6 +6,17 @@ import { CAR_PARTS_DATA, CATEGORY_OPTIONS } from './src/data/partsData.ts';
 import { CarPart, OrderRecord, PartRequest, PaymentDetails, ShippingAddress, User } from './src/types.ts';
 import { CURRENCIES } from './src/utils/currency.ts';
 import Tesseract from 'tesseract.js';
+import {
+  hashPassword,
+  verifyPassword,
+  bearerToken,
+  identifyCaller,
+  stripOwnerFields,
+  loginBlocked,
+  recordFailedLogin,
+  clearFailedLogins,
+} from './security.ts';
+import { createStorage, StoredUser, StoredOrder, StoredRfq } from './storage.ts';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -26,26 +37,32 @@ const ADMIN_PAYMENT_EMAIL = 'apexparts45@gmail.com';
 // In-memory data store for backend state
 const partsDatabase: CarPart[] = [...CAR_PARTS_DATA];
 
-// In-memory user database
-interface StoredUser extends User {
-  passwordHash: string;
-}
-
-const usersDatabase: StoredUser[] = [];
-const ordersDatabase: OrderRecord[] = [];
-const rfqDatabase: PartRequest[] = [];
-
 async function startServer() {
   const app = express();
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
+  // Accounts, login sessions, orders and sourcing requests live in PostgreSQL (Neon)
+  // when DATABASE_URL is set, otherwise in temporary memory.
+  const storage = await createStorage();
+  const who = (req: Request) => identifyCaller(req.headers, (t) => storage.getSessionUserId(t));
+
   app.use(express.json({ limit: '25mb' }));
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
+  app.disable('x-powered-by');
+
+  // API privacy: never cache, and never send the private owner fields to a browser
+  app.use('/api', (req: Request, res: Response, next: any) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const originalJson = res.json.bind(res);
+    (res as any).json = (body: any) => originalJson(stripOwnerFields(body));
+    next();
+  });
 
   // --- API Routes ---
 
   // 1. Healthcheck
-  app.get('/api/health', (req: Request, res: Response) => {
+  app.get('/api/health', async (req: Request, res: Response) => {
+    const counts = await storage.counts().catch(() => ({ orders: -1, rfqs: -1 }));
     res.json({
       status: 'ok',
       service: 'ApexParts Global Automotive Parts Backend',
@@ -53,8 +70,9 @@ async function startServer() {
       uptime: process.uptime(),
       timestamp: new Date().toISOString(),
       partsAvailable: partsDatabase.length,
-      ordersPlaced: ordersDatabase.length,
-      rfqsLogged: rfqDatabase.length,
+      ordersPlaced: counts.orders,
+      rfqsLogged: counts.rfqs,
+      storage: storage.kind,
     });
   });
 
@@ -193,17 +211,20 @@ async function startServer() {
   });
 
   // 5. Orders - Get All
-  app.get('/api/orders', (req: Request, res: Response) => {
+  app.get('/api/orders', async (req: Request, res: Response) => {
+    const caller = await who(req);
+    const mine = await storage.listOrders(caller);
     res.json({
       success: true,
-      count: ordersDatabase.length,
-      orders: ordersDatabase,
+      count: mine.length,
+      orders: mine,
     });
   });
 
   // 6. Orders - Get Specific Order by ID
-  app.get('/api/orders/:orderId', (req: Request, res: Response) => {
-    const order = ordersDatabase.find((o) => o.orderId === req.params.orderId);
+  app.get('/api/orders/:orderId', async (req: Request, res: Response) => {
+    const caller = await who(req);
+    const order = await storage.getOrder(req.params.orderId, caller);
     if (!order) {
       res.status(404).json({ success: false, error: 'Order not found' });
       return;
@@ -211,24 +232,21 @@ async function startServer() {
     res.json({ success: true, order });
   });
 
-  // Delete Specific Order
-  app.delete('/api/orders/:orderId', (req: Request, res: Response) => {
+  // Delete Specific Order (only the caller's own)
+  app.delete('/api/orders/:orderId', async (req: Request, res: Response) => {
     const { orderId } = req.params;
-    const idx = ordersDatabase.findIndex((o) => o.orderId === orderId);
-    if (idx !== -1) {
-      ordersDatabase.splice(idx, 1);
-    }
+    await storage.deleteOrder(orderId, await who(req));
     res.json({ success: true, message: `Order ${orderId} removed.` });
   });
 
-  // Clear All Orders
-  app.delete('/api/orders', (req: Request, res: Response) => {
-    ordersDatabase.length = 0;
-    res.json({ success: true, message: 'All orders cleared.' });
+  // Clear All Orders (only the caller's own, never anyone else's)
+  app.delete('/api/orders', async (req: Request, res: Response) => {
+    await storage.deleteAllOrders(await who(req));
+    res.json({ success: true, message: 'Your orders were cleared.' });
   });
 
   // 7. Authentication - Register
-  app.post('/api/auth/register', (req: Request, res: Response) => {
+  app.post('/api/auth/register', async (req: Request, res: Response) => {
     try {
       const {
         email,
@@ -262,7 +280,7 @@ async function startServer() {
       }
 
       const normalizedEmail = email.toLowerCase().trim();
-      const existingUser = usersDatabase.find((u) => u.email.toLowerCase() === normalizedEmail);
+      const existingUser = await storage.findUserByEmail(normalizedEmail);
       if (existingUser) {
         res.status(409).json({
           success: false,
@@ -274,7 +292,7 @@ async function startServer() {
       const newUser: StoredUser = {
         id: `usr-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`,
         email: normalizedEmail,
-        passwordHash: password, // In-memory simulated storage
+        passwordHash: hashPassword(password), // salted scrypt hash, never the plain password
         fullName: fullName.trim(),
         companyName: companyName ? companyName.trim() : undefined,
         phoneNumber: phoneNumber ? phoneNumber.trim() : undefined,
@@ -286,11 +304,20 @@ async function startServer() {
         createdAt: new Date().toISOString(),
       };
 
-      usersDatabase.push(newUser);
+      try {
+        await storage.createUser(newUser);
+      } catch (e: any) {
+        // two sign-ups with the same email at the same moment
+        res.status(409).json({
+          success: false,
+          error: 'An account with this email address already exists. Please log in.',
+        });
+        return;
+      }
 
       // Return user without password
       const { passwordHash: _, ...safeUser } = newUser;
-      const token = `token_${newUser.id}_${Date.now()}`;
+      const token = await storage.createSession(newUser.id);
 
       res.status(201).json({
         success: true,
@@ -304,7 +331,7 @@ async function startServer() {
   });
 
   // 8. Authentication - Login
-  app.post('/api/auth/login', (req: Request, res: Response) => {
+  app.post('/api/auth/login', async (req: Request, res: Response) => {
     try {
       const { email, password } = req.body;
 
@@ -314,9 +341,19 @@ async function startServer() {
       }
 
       const normalizedEmail = email.toLowerCase().trim();
-      const user = usersDatabase.find((u) => u.email.toLowerCase() === normalizedEmail);
+      const user = await storage.findUserByEmail(normalizedEmail);
 
-      if (!user || user.passwordHash !== password) {
+      const throttleKeys = [`ip:${req.ip}:${normalizedEmail}`, `email:${normalizedEmail}`];
+      if (throttleKeys.some((k) => loginBlocked(k))) {
+        res.status(429).json({
+          success: false,
+          error: 'Too many failed login attempts. Please wait 15 minutes and try again.',
+        });
+        return;
+      }
+
+      if (!user || !verifyPassword(String(password), user.passwordHash)) {
+        throttleKeys.forEach((k) => recordFailedLogin(k));
         res.status(401).json({
           success: false,
           error: 'Invalid email or password. Please verify your credentials.',
@@ -324,8 +361,9 @@ async function startServer() {
         return;
       }
 
+      throttleKeys.forEach((k) => clearFailedLogins(k));
       const { passwordHash: _, ...safeUser } = user;
-      const token = `token_${user.id}_${Date.now()}`;
+      const token = await storage.createSession(user.id);
 
       res.json({
         success: true,
@@ -338,20 +376,17 @@ async function startServer() {
     }
   });
 
+  // Authentication - Logout (invalidates the login token on the server)
+  app.post('/api/auth/logout', async (req: Request, res: Response) => {
+    await storage.deleteSession(bearerToken(req.headers.authorization));
+    res.json({ success: true });
+  });
+
   // 9. Authentication - Current User
-  app.get('/api/auth/me', (req: Request, res: Response) => {
+  app.get('/api/auth/me', async (req: Request, res: Response) => {
     try {
-      const authHeader = req.headers.authorization;
-      const emailQuery = req.query.email as string;
-
-      let user: StoredUser | undefined;
-
-      if (authHeader && authHeader.startsWith('Bearer token_usr-')) {
-        const userId = authHeader.replace('Bearer token_', '').split('_')[0];
-        user = usersDatabase.find((u) => u.id === userId);
-      } else if (emailQuery) {
-        user = usersDatabase.find((u) => u.email.toLowerCase() === emailQuery.toLowerCase().trim());
-      }
+      const userId = await storage.getSessionUserId(bearerToken(req.headers.authorization));
+      const user: StoredUser | undefined = userId ? await storage.findUserById(userId) : undefined;
 
       if (!user) {
         res.status(401).json({ success: false, error: 'Unauthorized. Please log in.' });
@@ -366,8 +401,16 @@ async function startServer() {
   });
 
   // 10. Orders - Place/Submit Order with Min/Max Order Enforcement & Email Notification
-  app.post('/api/orders', (req: Request, res: Response) => {
+  app.post('/api/orders', async (req: Request, res: Response) => {
     try {
+      const orderCaller = await who(req);
+      if (!orderCaller.clientId && !orderCaller.userId) {
+        res.status(400).json({
+          success: false,
+          error: 'Your browser could not be identified. Please refresh the page and try again.',
+        });
+        return;
+      }
       const {
         items,
         shippingAddress,
@@ -602,8 +645,8 @@ async function startServer() {
         console.warn('[Email Dispatch Trigger Failed]:', e?.message);
       }
 
-      // Prepend to orders database
-      ordersDatabase.unshift(newOrder);
+      // Prepend to orders database, remembering who owns it
+      await storage.insertOrder({ ...newOrder, ownerClientId: orderCaller.clientId, ownerUserId: orderCaller.userId });
 
       res.status(201).json({
         success: true,
@@ -625,7 +668,7 @@ async function startServer() {
       const { orderId } = req.params;
       const { screenshot, transactionId, notes } = req.body;
 
-      const order = ordersDatabase.find((o) => o.orderId === orderId);
+      const order = await storage.getOrder(orderId, await who(req));
       if (!order) {
         res.status(404).json({ success: false, error: `Order ${orderId} not found in database.` });
         return;
@@ -724,6 +767,7 @@ async function startServer() {
       order.paymentDetails.screenshotUrl = screenshot;
       order.paymentDetails.verifiedAt = new Date().toISOString();
       order.paymentDetails.verificationNotes = verificationReason;
+      await storage.saveOrder(order); // persist the new "Payment Successful" status
 
       console.log(`\n======================================================`);
       console.log(`[PAYMENT VERIFIED & APPROVED]`);
@@ -751,7 +795,7 @@ async function startServer() {
   });
 
   // 8. Custom Part Sourcing (RFQ) - Submit Request
-  app.post('/api/rfq', (req: Request, res: Response) => {
+  app.post('/api/rfq', async (req: Request, res: Response) => {
     try {
       const {
         year = '2022',
@@ -865,7 +909,8 @@ async function startServer() {
         console.warn('[RFQ Email Dispatch Trigger Failed]:', e?.message);
       }
 
-      rfqDatabase.unshift(newRfq);
+      const rfqCaller = await who(req);
+      await storage.insertRfq({ ...newRfq, ownerClientId: rfqCaller.clientId, ownerUserId: rfqCaller.userId });
 
       res.status(201).json({
         success: true,
@@ -882,11 +927,13 @@ async function startServer() {
   });
 
   // 9. Custom Part Sourcing (RFQ) - List Requests
-  app.get('/api/rfq', (req: Request, res: Response) => {
+  app.get('/api/rfq', async (req: Request, res: Response) => {
+    const caller = await who(req);
+    const mine = await storage.listRfqs(caller);
     res.json({
       success: true,
-      count: rfqDatabase.length,
-      rfqs: rfqDatabase,
+      count: mine.length,
+      rfqs: mine,
     });
   });
 
